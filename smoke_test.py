@@ -1,40 +1,49 @@
+import os
 import requests
-import json
+from supportdesk_env.logging_config import get_logger
 
-BASE_URL = "http://127.0.0.1:8000"
+# Initialize professional logger
+logger = get_logger("smoke_test")
 
-def test_flow():
+BASE_URL = os.getenv("ENV_BASE_URL", "http://127.0.0.1:8000")
+
+def run_smoke_test():
+    """Manually verifies the API connection and basic task flow."""
     try:
-        print("--- 1. Resetting Environment ---")
+        # 1. Reset the environment
+        logger.info("--- 1. Resetting Environment ---")
         reset_resp = requests.post(f"{BASE_URL}/reset", json={"task_id": "login_lockout"})
-        reset_resp.raise_for_status()
-        obs = reset_resp.json()["observation"]
-        print(f"Task: {obs['title']}")
+        
+        if reset_resp.status_code != 200:
+            logger.error(f"Reset failed (Status {reset_resp.status_code}): {reset_resp.text}")
+            return
 
-        print("\n--- 2. Submitting Action ---")
-        # Creating a policy-compliant action for the login_lockout task
+        data = reset_resp.json()
+        logger.info(f"Connected to Task: {data['observation']['title']}")
+
+        # 2. Submit a test action
+        logger.info("--- 2. Submitting Manual Action ---")
         action = {
-            "action_type": "finalize",
-            "issue_type": "account_access",
-            "priority": "medium",
+            "action_type": "classify",
             "team": "account_access",
-            "status": "responded",
-            "tags": ["password_reset", "login_issue"],
-            "message": "Sorry for the trouble. Please check your spam folder for the reset link, try the reset flow again, and confirm 2fa on the current device if it still blocks access.",
-            "internal_note": "Triaged by smoke test",
-            "confidence": 1.0
+            "priority": "medium",
+            "issue_type": "login_lockout",
+            "confidence": 0.9
         }
         step_resp = requests.post(f"{BASE_URL}/step", json=action)
-        step_resp.raise_for_status()
+        
+        if step_resp.status_code != 200:
+            logger.error(f"Step failed (Status {step_resp.status_code}): {step_resp.text}")
+            return
+
         result = step_resp.json()
-        print(f"Reward: {result['reward']['total']}")
-        print(f"Current Score: {result['observation']['current_score']}")
-        print(f"Feedback: {result['observation']['last_feedback'][:100]}...")
-        print(f"Done: {result['done']}")
+        logger.info(f"Current Score: {result['observation']['current_score']}")
+        logger.info(f"Feedback: {result['observation']['last_feedback'][:100]}...")
+        logger.info(f"Done: {result['done']}")
         
     except Exception as e:
-        print(f"Error connecting to server: {e}")
-        print("Make sure the uvicorn server is running on port 8000!")
+        logger.error(f"Failed to connect to simulation server: {e}")
+        logger.info("Tip: Ensure 'uvicorn supportdesk_env.server.app:app' is running.")
 
 if __name__ == "__main__":
-    test_flow()
+    run_smoke_test()

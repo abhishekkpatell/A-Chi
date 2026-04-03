@@ -10,16 +10,24 @@ from typing import Any, Dict, List
 from dotenv import load_dotenv
 from openai import OpenAI
 from supportdesk_env.client import SupportDeskClient
-from supportdesk_env.grader import score_action
+from supportdesk_env.grader import score_action, summarize_action
+from supportdesk_env.logging_config import get_logger
 from supportdesk_env.models import SupportAction
 from supportdesk_env.task_bank import TASK_ORDER, TASKS, get_task
 
 # Load environment variables from .env file
 load_dotenv()
 
-# Initialize client from environment variables
+# Pre-defined environment configuration as per requirements
+IMAGE_NAME = os.getenv("LOCAL_IMAGE_NAME")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://127.0.0.1:8000")
+MODEL_NAME = os.getenv("MODEL_NAME", "gpt-4o-mini")
+BENCHMARK = "supportdesk_v1"
+
+# Initialize clients
+logger = get_logger("inference")
 client = OpenAI(
-    base_url=os.getenv("API_BASE_URL"),
+    base_url=API_BASE_URL,
     api_key=os.getenv("HF_TOKEN") or os.getenv("OPENAI_API_KEY")
 )
 
@@ -118,16 +126,28 @@ def _call_model_action(client: OpenAI, model: str, observation: Dict[str, Any], 
     return SupportAction.model_validate(data)
 
 
-def _print_start(payload: Dict[str, Any]) -> None:
-    print(f"[START] {json.dumps(payload, sort_keys=True, ensure_ascii=False)}", flush=True)
+def _print_start(task: str) -> None:
+    """[START] task=<task_name> env=<benchmark> model=<model_name>"""
+    print(f"[START] task={task} env={BENCHMARK} model={MODEL_NAME}", flush=True)
 
 
-def _print_step(payload: Dict[str, Any]) -> None:
-    print(f"[STEP] {json.dumps(payload, sort_keys=True, ensure_ascii=False)}", flush=True)
+def _print_step(step: int, action: str, reward: float, done: bool, error: str | None = None) -> None:
+    """[STEP] step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>"""
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    print(
+        f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+        flush=True,
+    )
 
 
-def _print_end(payload: Dict[str, Any]) -> None:
-    print(f"[END] {json.dumps(payload, sort_keys=True, ensure_ascii=False)}", flush=True)
+def _print_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    """[END] success=<true|false> steps=<n> rewards=<r1,r2,...,rn>"""
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(
+        f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+        flush=True,
+    )
 
 
 def run_episode(
@@ -140,6 +160,7 @@ def run_episode(
 ) -> Dict[str, Any]:
     reset_result = env.reset(task_id=task_id)
     observation = reset_result.observation
+    rewards: List[float] = []
     trajectory: List[Dict[str, Any]] = []
 
     for turn in range(max_turns):
@@ -154,37 +175,39 @@ def run_episode(
 
         step_result = env.step(action)
         observation = step_result.observation
-        trajectory.append(
-            {
-                "turn": turn + 1,
-                "action": action.model_dump(exclude_none=True),
-                "reward": step_result.reward.total,
-                "score": observation.current_score,
-                "done": step_result.done,
-                "feedback": step_result.info.get("feedback"),
-            }
-        )
+        reward = step_result.reward.total
+        done = step_result.done
+        error = step_result.info.get("error")
+        
+        rewards.append(reward)
         _print_step(
-            {
-                "task_id": task_id,
-                "turn": turn + 1,
-                "action": action.model_dump(exclude_none=True),
-                "reward": step_result.reward.model_dump(),
-                "score": observation.current_score,
-                "done": step_result.done,
-                "feedback": step_result.info.get("feedback"),
-            }
+            step=turn + 1,
+            action=summarize_action(action),
+            reward=reward,
+            done=done,
+            error=error
         )
         if step_result.done:
             break
 
     final_state = env.state()
+    final_score = final_state.best_score
+    success = final_score >= 1.0  # Success threshold for SupportDesk
+    
+    _print_end(
+        success=success,
+        steps=final_state.turn,
+        score=final_score,
+        rewards=rewards
+    )
+    
     return {
         "task_id": task_id,
         "difficulty": get_task(task_id).difficulty,
-        "final_score": final_state.best_score,
+        "final_score": final_score,
         "turns": final_state.turn,
         "transcript": final_state.transcript,
+        "success": success
     }
 
 
@@ -201,36 +224,17 @@ def main() -> None:
     if not args.offline and not client.api_key:
         raise SystemExit("API_BASE_URL and (HF_TOKEN or OPENAI_API_KEY) environment variables are required unless --offline is set.")
 
-    _print_start(
-        {
-            "env_url": args.env_url,
-            "model": args.model,
-            "tasks": args.tasks,
-            "offline": args.offline,
-        }
-    )
-
     results: List[Dict[str, Any]] = []
+    total_score = 0.0
+    
     for task_id in args.tasks:
+        _print_start(task_id)
         result = run_episode(client, args.model, env, task_id, use_offline=args.offline)
         results.append(result)
-        _print_step(
-            {
-                "task_id": task_id,
-                "final_score": result["final_score"],
-                "turns": result["turns"],
-                "difficulty": result["difficulty"],
-            }
-        )
+        total_score += result["final_score"]
 
-    mean_score = sum(item["final_score"] for item in results) / len(results) if results else 0.0
-    _print_end(
-        {
-            "results": results,
-            "mean_score": mean_score,
-            "task_count": len(results),
-        }
-    )
+    mean_score = total_score / len(results) if results else 0.0
+    logger.info(f"Evaluation complete. Mean Score: {mean_score:.2f}")
 
 
 if __name__ == "__main__":
